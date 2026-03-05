@@ -25,16 +25,18 @@ from typing import Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
-from gsplat._torch_impl import quat_to_rotmat
-from gsplat.project_gaussians import project_gaussians
-from gsplat.rasterize import rasterize_gaussians
-from gsplat.sh import num_sh_bases, spherical_harmonics
+from gsplat.rendering import rasterization
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
+
+# from gsplat.rasterize import rasterize_gaussians
+# from gsplat.sh import num_sh_bases, spherical_harmonics
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 from typing_extensions import Literal
 
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.utils.misc import torch_compile
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.engine.callbacks import (
     TrainingCallback,
@@ -61,13 +63,41 @@ from nerfstudio.viewer.server.viewer_elements import (
     ViewerNumber,
     ViewerText,
 )
-
-try:
-    import tinycudann as tcnn
-except ImportError:
-    pass
+import tinycudann as tcnn
+# try:
+#     import tinycudann as tcnn
+# except ImportError:
+#     pass
 
 import time
+
+
+def num_sh_bases(degree: int) -> int:
+    """
+    Returns the number of spherical harmonic bases for a given degree.
+    """
+    assert degree <= 4, "We don't support degree greater than 4."
+    return (degree + 1) ** 2
+
+
+def quat_to_rotmat(quat):
+    assert quat.shape[-1] == 4, quat.shape
+    w, x, y, z = torch.unbind(quat, dim=-1)
+    mat = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return mat.reshape(quat.shape[:-1] + (3, 3))
 
 
 def random_quat_tensor(N):
@@ -102,6 +132,41 @@ def SH2RGB(sh):
     """
     C0 = 0.28209479177387814
     return sh * C0 + 0.5
+
+
+def resize_image(image: torch.Tensor, d: int):
+    """
+    Downscale images using the same 'area' method in opencv
+
+    :param image shape [H, W, C]
+    :param d downscale factor (must be 2, 4, 8, etc.)
+
+    return downscaled image in shape [H//d, W//d, C]
+    """
+    import torch.nn.functional as tf
+
+    image = image.to(torch.float32)
+    weight = (1.0 / (d * d)) * torch.ones((1, 1, d, d), dtype=torch.float32, device=image.device)
+    return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0)
+
+
+@torch_compile()
+def get_viewmat(optimized_camera_to_world):
+    """
+    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    """
+    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
+    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.transpose(1, 2)
+    T_inv = -torch.bmm(R_inv, T)
+    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
+    viewmat[:, 3, 3] = 1.0  # homogenous
+    viewmat[:, :3, :3] = R_inv
+    viewmat[:, :3, 3:4] = T_inv
+    return viewmat
 
 
 class Autoencoder(torch.nn.Module):
@@ -211,7 +276,7 @@ class SageSplatModelConfig(SplatfactoModelConfig):
     """threshold of ratio of gaussian max to min scale before applying regularization
     loss from the PhysGaussian paper
     """
-    output_depth_during_training: bool = False
+    output_depth_during_training: bool = True
     """If True, output depth during training. Otherwise, only output depth during evaluation."""
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
     """
@@ -237,6 +302,14 @@ class SageSplatModelConfig(SplatfactoModelConfig):
     """weight for the CLIP-related term in the loss function."""
     affordance_loss_weight: float = 1e-1
     """weight for the affordance-related term in the loss function."""
+
+    # Depth supervision configuration
+    use_depth_loss: bool = False
+    depth_loss_type: str = "EdgeAwareLogL1"
+    depth_lambda: float = 0.1
+    use_depth_smooth_loss: bool = False
+    smooth_loss_type: str = "EdgeAwareTV"  # one of ["TV", "EdgeAwareTV"]
+    smooth_loss_lambda: float = 0.05
 
     # MLP head
     hidden_dim: int = 128
@@ -375,6 +448,26 @@ class SageSplatModel(SplatfactoModel):
             }
         )
 
+        # Strategy for GS densification
+        self.strategy = DefaultStrategy(
+            prune_opa=self.config.cull_alpha_thresh,
+            grow_grad2d=self.config.densify_grad_thresh,
+            grow_scale3d=self.config.densify_size_thresh,
+            grow_scale2d=self.config.split_screen_size,
+            prune_scale3d=self.config.cull_scale_thresh,
+            prune_scale2d=self.config.cull_screen_size,
+            refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+            refine_start_iter=self.config.warmup_length,
+            refine_stop_iter=self.config.stop_split_at,
+            reset_every=self.config.reset_alpha_every * self.config.refine_every,
+            refine_every=self.config.refine_every,
+            pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+            absgrad=self.config.use_absgrad,
+            revised_opacity=False,
+            verbose=True,
+        )
+        self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
@@ -404,6 +497,29 @@ class SageSplatModel(SplatfactoModel):
         self.viewer_utils = ViewerUtils(self.image_encoder)
 
         self.setup_gui()
+
+        # Depth loss modules (optional)
+        self.depth_loss = None
+        self.smooth_loss = None
+        if self.config.use_depth_loss or self.config.use_depth_smooth_loss:
+            try:
+                from dn_splatter.losses import DepthLoss, DepthLossType, TVLoss, EdgeAwareTV  # type: ignore
+                if self.config.use_depth_loss:
+                    try:
+                        depth_type = DepthLossType[self.config.depth_loss_type]
+                    except Exception:
+                        # fallback
+                        depth_type = DepthLossType.LogL1
+                    self.depth_loss = DepthLoss(depth_loss_type=depth_type)
+                if self.config.use_depth_smooth_loss:
+                    if self.config.smooth_loss_type == "EdgeAwareTV":
+                        self.smooth_loss = EdgeAwareTV()
+                    else:
+                        self.smooth_loss = TVLoss()
+            except Exception as _:
+                # Graceful degradation if dn_splatter is not available
+                self.depth_loss = None
+                self.smooth_loss = None
 
     @property
     def colors(self):
@@ -867,6 +983,28 @@ class SageSplatModel(SplatfactoModel):
         for name, param in self.gauss_params.items():
             new_dups[name] = param[dup_mask]
         return new_dups
+    def step_post_backward(self, step):
+        assert step == self.step
+        if isinstance(self.strategy, DefaultStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info,
+                packed=False,
+            )
+        elif isinstance(self.strategy, MCMCStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=self.info,
+                lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
+            )
+        else:
+            raise ValueError(f"Unknown strategy {self.strategy}")
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -874,28 +1012,23 @@ class SageSplatModel(SplatfactoModel):
         cbs = []
         cbs.append(
             TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
-            )
-        )
-        # The order of these matters
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.after_train,
-            )
-        )
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.refinement_after,
-                update_every_num_iters=self.config.refine_every,
+                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                self.step_cb,
                 args=[training_callback_attributes.optimizers],
+            )
+        )
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.step_post_backward,
             )
         )
         return cbs
 
-    def step_cb(self, step):
+    def step_cb(self, optimizers: Optimizers, step):
         self.step = step
+        self.optimizers = optimizers.optimizers
+        self.schedulers = optimizers.schedulers
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
@@ -956,14 +1089,11 @@ class SageSplatModel(SplatfactoModel):
     @torch.no_grad()
     def get_semantic_outputs(self, outputs: Dict[str, torch.Tensor]):
         if not self.training:
-            # Normalize CLIP features rendered by feature field
+            # Decode/query CLIP features in chunks to avoid large peak allocations.
             clip_features = outputs["clip"]
-            clip_features = (
-                self.clip_decoder(clip_features.view(-1, self.clip_embeds_latent_dim))
-                .view(*outputs["clip"].shape[:-1], self.clip_embeds_input_dim)
-                .float()
-            )
-            clip_features /= clip_features.norm(dim=-1, keepdim=True)
+            original_shape = clip_features.shape[:-1]
+            flat_clip = clip_features.reshape(-1, self.clip_embeds_latent_dim)
+            decode_chunk_size = 32768
 
             if self.viewer_utils.has_positives:
                 if self.viewer_utils.has_negatives:
@@ -972,40 +1102,66 @@ class SageSplatModel(SplatfactoModel):
                         [self.viewer_utils.pos_embed, self.viewer_utils.neg_embed],
                         dim=0,
                     )
+                    text_embs = text_embs.to(device=flat_clip.device)
 
-                    raw_sims = clip_features @ text_embs.T
+                    similarity_chunks = []
+                    raw_similarity_chunks = []
+                    for start in range(0, flat_clip.shape[0], decode_chunk_size):
+                        end = min(start + decode_chunk_size, flat_clip.shape[0])
+                        decoded_chunk = self.clip_decoder(flat_clip[start:end])
+                        decoded_chunk = decoded_chunk / decoded_chunk.norm(
+                            dim=-1, keepdim=True
+                        ).clamp_min(1e-6)
+                        text_chunk = text_embs.to(dtype=decoded_chunk.dtype)
+                        raw_sims_chunk = decoded_chunk @ text_chunk.T
 
-                    # Broadcast positive label similarities to all negative labels
-                    pos_sims, neg_sims = raw_sims[..., :1], raw_sims[..., 1:]
-                    pos_sims = pos_sims.broadcast_to(neg_sims.shape)
+                        # Broadcast positive similarities to all negative labels.
+                        pos_sims = raw_sims_chunk[..., :1]
+                        neg_sims = raw_sims_chunk[..., 1:]
+                        pos_sims_expanded = pos_sims.expand_as(neg_sims)
+                        paired_sims = torch.cat(
+                            (
+                                pos_sims_expanded.reshape((-1, 1)),
+                                neg_sims.reshape((-1, 1)),
+                            ),
+                            dim=-1,
+                        )
 
-                    # Updated Code
-                    paired_sims = torch.cat(
-                        (pos_sims.reshape((-1, 1)), neg_sims.reshape((-1, 1))), dim=-1
+                        probs = paired_sims.softmax(dim=-1)[..., :1]
+                        probs = probs.reshape((-1, neg_sims.shape[-1]))
+                        torch.nan_to_num_(probs, nan=0.0)
+
+                        sims_chunk, _ = probs.min(dim=-1, keepdim=True)
+                        similarity_chunks.append(sims_chunk)
+                        raw_similarity_chunks.append(pos_sims)
+
+                    outputs["similarity"] = torch.cat(similarity_chunks, dim=0).view(
+                        *original_shape, 1
                     )
-
-                    # compute the paired softmax
-                    probs = paired_sims.softmax(dim=-1)[..., :1]
-                    probs = probs.reshape((-1, neg_sims.shape[-1]))
-
-                    torch.nan_to_num_(probs, nan=0.0)
-
-                    sims, _ = probs.min(dim=-1, keepdim=True)
-                    outputs["similarity"] = sims.reshape((*pos_sims.shape[:-1], 1))
-
-                    # cosine similarity
-                    outputs["raw_similarity"] = raw_sims[..., :1]
+                    outputs["raw_similarity"] = torch.cat(
+                        raw_similarity_chunks, dim=0
+                    ).view(*original_shape, 1)
                 else:
                     # positive embeddings
                     text_embs = self.viewer_utils.pos_embed
+                    text_embs = text_embs.to(device=flat_clip.device)
 
-                    sims = clip_features @ text_embs.T
-                    # Show the mean similarity if there are multiple positives
-                    if sims.shape[-1] > 1:
-                        sims = sims.mean(dim=-1, keepdim=True)
+                    sims_chunks = []
+                    for start in range(0, flat_clip.shape[0], decode_chunk_size):
+                        end = min(start + decode_chunk_size, flat_clip.shape[0])
+                        decoded_chunk = self.clip_decoder(flat_clip[start:end])
+                        decoded_chunk = decoded_chunk / decoded_chunk.norm(
+                            dim=-1, keepdim=True
+                        ).clamp_min(1e-6)
+                        text_chunk = text_embs.to(dtype=decoded_chunk.dtype)
+
+                        sims_chunk = decoded_chunk @ text_chunk.T
+                        if sims_chunk.shape[-1] > 1:
+                            sims_chunk = sims_chunk.mean(dim=-1, keepdim=True)
+                        sims_chunks.append(sims_chunk)
+
+                    sims = torch.cat(sims_chunks, dim=0).view(*original_shape, 1)
                     outputs["similarity"] = sims
-
-                    # cosine similarity
                     outputs["raw_similarity"] = sims
 
                 # for outputs similar to the GUI
@@ -1023,19 +1179,41 @@ class SageSplatModel(SplatfactoModel):
                 affordance_probs = outputs["affordance"]
                 mask = affordance_probs <= affordance_threshold
 
-                outputs["composited_affordance"] = apply_colormap(
-                    affordance_probs, ColormapOptions("turbo")
-                )
+                # # Normalize affordance probs to [0, 1] and ensure it's the right shape for colormap
+                # affordance_normalized = affordance_probs.squeeze()
+                # if affordance_normalized.dim() == 3 and affordance_normalized.shape[-1] == 1:
+                #     affordance_normalized = affordance_normalized.squeeze(-1)
+                
+                # # Handle multi-channel affordance (take first channel)
+                # if affordance_normalized.dim() == 3 and affordance_normalized.shape[-1] > 1:
+                #     # Take first channel
+                #     affordance_normalized = affordance_normalized[..., 0]
+                
+                # # Ensure values are in [0, 1] range
+                # affordance_normalized = torch.clamp(affordance_normalized, 0.0, 1.0)
+                
+                # # Add channel dimension if needed (colormap expects [..., 1] shape)
+                # if affordance_normalized.dim() == 2:
+                #     affordance_normalized = affordance_normalized.unsqueeze(-1)
+                
+                # outputs["composited_affordance"] = apply_colormap(
+                #     affordance_probs, ColormapOptions("turbo")
+                # )
 
-                mask = mask.squeeze()
-                outputs["composited_affordance"][mask, :] = outputs["rgb"][mask, :]
+                # mask = mask.squeeze()
+                # outputs["composited_affordance"][mask, :] = outputs["rgb"][mask, :]
 
                 if self.viewer_utils.has_positives:
                     # composited similarity
                     p_i = torch.clip(outputs["similarity"] - 0.5, 0, 1)
+                    p_i_normalized = p_i / (p_i.max() + 1e-6)
+                    
+                    # Add channel dimension if needed (colormap expects [..., 1] shape)
+                    if p_i_normalized.dim() == 2:
+                        p_i_normalized = p_i_normalized.unsqueeze(-1)
 
                     outputs["composited_similarity"] = apply_colormap(
-                        p_i / (p_i.max() + 1e-6), ColormapOptions("turbo")
+                        p_i_normalized, ColormapOptions("turbo")
                     )
                     mask = (outputs["similarity"] < 0.5).squeeze()
                     outputs["composited_similarity"][mask, :] = outputs["rgb"][mask, :]
@@ -1045,8 +1223,19 @@ class SageSplatModel(SplatfactoModel):
                     p_i = p_i / (p_i.max() + 1e-6)
 
                     semantic_affordance = p_i * affordance_probs
+                    
+                    # Normalize semantic affordance for colormap
+                    semantic_affordance_normalized = semantic_affordance.squeeze()
+                    if semantic_affordance_normalized.dim() == 3 and semantic_affordance_normalized.shape[-1] == 1:
+                        semantic_affordance_normalized = semantic_affordance_normalized.squeeze(-1)
+                    semantic_affordance_normalized = torch.clamp(semantic_affordance_normalized, 0.0, 1.0)
+                    
+                    # Add channel dimension if needed (colormap expects [..., 1] shape)
+                    if semantic_affordance_normalized.dim() == 2:
+                        semantic_affordance_normalized = semantic_affordance_normalized.unsqueeze(-1)
+                    
                     outputs["semantic_affordance"] = apply_colormap(
-                        semantic_affordance, ColormapOptions("turbo")
+                        semantic_affordance_normalized, ColormapOptions("turbo")
                     )
 
                     mask = (semantic_affordance < 0.25).squeeze()
@@ -1067,71 +1256,188 @@ class SageSplatModel(SplatfactoModel):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        # if not isinstance(camera, Cameras):
+        #     print("Called get_outputs with not a camera")
+        #     return {}
+        # assert camera.shape[0] == 1, "Only one camera at a time"
+
+        # # get the background color
+        # if self.training:
+        #     optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)[
+        #         0, ...
+        #     ]
+
+        #     if self.config.background_color == "random":
+        #         background = torch.rand(3, device=self.device)
+        #     elif self.config.background_color == "white":
+        #         background = torch.ones(3, device=self.device)
+        #     elif self.config.background_color == "black":
+        #         background = torch.zeros(3, device=self.device)
+        #     else:
+        #         background = self.background_color.to(self.device)
+        # else:
+        #     optimized_camera_to_world = camera.camera_to_worlds[0, ...]
+
+        #     if renderers.BACKGROUND_COLOR_OVERRIDE is not None:
+        #         background = renderers.BACKGROUND_COLOR_OVERRIDE.to(self.device)
+        #     else:
+        #         background = self.background_color.to(self.device)
+
+        # if self.crop_box is not None and not self.training:
+        #     crop_ids = self.crop_box.within(self.means).squeeze()
+        #     if crop_ids.sum() == 0:
+        #         rgb = background.repeat(
+        #             int(camera.height.item()), int(camera.width.item()), 1
+        #         )
+        #         depth = background.new_ones(*rgb.shape[:2], 1) * 10
+        #         accumulation = background.new_zeros(*rgb.shape[:2], 1)
+        #         return {
+        #             "rgb": rgb,
+        #             "depth": depth,
+        #             "accumulation": accumulation,
+        #             "background": background,
+        #         }
+        # else:
+        #     crop_ids = None
+        # camera_downscale = self._get_downscale_factor()
+        # camera.rescale_output_resolution(1 / camera_downscale)
+        # # shift the camera to center of scene looking at center
+        # R = optimized_camera_to_world[:3, :3]  # 3 x 3
+        # T = optimized_camera_to_world[:3, 3:4]  # 3 x 1
+
+        # # flip the z and y axes to align with gsplat conventions
+        # R_edit = torch.diag(
+        #     torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype)
+        # )
+        # R = R @ R_edit
+        # # analytic matrix inverse to get world2camera matrix
+        # R_inv = R.T
+        # T_inv = -R_inv @ T
+        # viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
+        # viewmat[:3, :3] = R_inv
+        # viewmat[:3, 3:4] = T_inv
+        # # calculate the FOV of the camera given fx and fy, width and height
+        # cx = camera.cx.item()
+        # cy = camera.cy.item()
+        # W, H = int(camera.width.item()), int(camera.height.item())
+        # self.last_size = (H, W)
+
+        # if crop_ids is not None:
+        #     opacities_crop = self.opacities[crop_ids]
+        #     means_crop = self.means[crop_ids]
+        #     features_dc_crop = self.features_dc[crop_ids]
+        #     features_rest_crop = self.features_rest[crop_ids]
+        #     scales_crop = self.scales[crop_ids]
+        #     quats_crop = self.quats[crop_ids]
+        #     clip_embeds_crop = self.clip_embeds[crop_ids]
+        #     affordance_crop = self.affordance[crop_ids]
+        # else:
+        #     opacities_crop = self.opacities
+        #     means_crop = self.means
+        #     features_dc_crop = self.features_dc
+        #     features_rest_crop = self.features_rest
+        #     scales_crop = self.scales
+        #     quats_crop = self.quats
+        #     clip_embeds_crop = self.clip_embeds
+        #     affordance_crop = self.affordance
+
+        # colors_crop = torch.cat(
+        #     (features_dc_crop[:, None, :], features_rest_crop), dim=1
+        # )
+        # BLOCK_WIDTH = (
+        #     16  # this controls the tile size of rasterization, 16 is a good default
+        # )
+        # self.xys, depths, self.radii, conics, comp, num_tiles_hit, cov3d = project_gaussians(  # type: ignore
+        #     means_crop,
+        #     torch.exp(scales_crop),
+        #     1,
+        #     quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+        #     viewmat.squeeze()[:3, :],
+        #     camera.fx.item(),
+        #     camera.fy.item(),
+        #     cx,
+        #     cy,
+        #     H,
+        #     W,
+        #     BLOCK_WIDTH,
+        # )  # type: ignore
+
+        # # rescale the camera back to original dimensions before returning
+        # camera.rescale_output_resolution(camera_downscale)
+
+        # if (self.radii).sum() == 0:
+        #     rgb = background.repeat(H, W, 1)
+        #     depth = background.new_ones(*rgb.shape[:2], 1) * 10
+        #     accumulation = background.new_zeros(*rgb.shape[:2], 1)
+
+        #     return {
+        #         "rgb": rgb,
+        #         "depth": depth,
+        #         "accumulation": accumulation,
+        #         "background": background,
+        #     }
+
+        # # Important to allow xys grads to populate properly
+        # if self.training:
+        #     # TODO
+        #     if self.means.requires_grad:
+        #         self.xys.retain_grad()
+
+        # if self.config.sh_degree > 0:
+        #     viewdirs = (
+        #         means_crop.detach() - optimized_camera_to_world.detach()[:3, 3]
+        #     )  # (N, 3)
+        #     viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+        #     n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+        #     rgbs = spherical_harmonics(n, viewdirs, colors_crop)
+        #     rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
+        # else:
+        #     rgbs = torch.sigmoid(colors_crop[:, 0, :])
+
+        # assert (num_tiles_hit > 0).any()  # type: ignore
+
+        # # apply the compensation of screen space blurring to gaussians
+        # opacities = None
+        # if self.config.rasterize_mode == "antialiased":
+        #     opacities = torch.sigmoid(opacities_crop) * comp[:, None]
+        # elif self.config.rasterize_mode == "classic":
+        #     opacities = torch.sigmoid(opacities_crop)
+        # else:
+        #     raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
+
+        # rgb, alpha = rasterize_gaussians(  # type: ignore
+        #     self.xys,
+        #     depths,
+        #     self.radii,
+        #     conics,
+        #     num_tiles_hit,  # type: ignore
+        #     rgbs,
+        #     opacities,
+        #     H,
+        #     W,
+        #     BLOCK_WIDTH,
+        #     background=background,
+        #     return_alpha=True,
+        # )  # type: ignore
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
-        assert camera.shape[0] == 1, "Only one camera at a time"
 
-        # get the background color
         if self.training:
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)[
-                0, ...
-            ]
-
-            if self.config.background_color == "random":
-                background = torch.rand(3, device=self.device)
-            elif self.config.background_color == "white":
-                background = torch.ones(3, device=self.device)
-            elif self.config.background_color == "black":
-                background = torch.zeros(3, device=self.device)
-            else:
-                background = self.background_color.to(self.device)
+            assert camera.shape[0] == 1, "Only one camera at a time"
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
         else:
-            optimized_camera_to_world = camera.camera_to_worlds[0, ...]
+            optimized_camera_to_world = camera.camera_to_worlds
 
-            if renderers.BACKGROUND_COLOR_OVERRIDE is not None:
-                background = renderers.BACKGROUND_COLOR_OVERRIDE.to(self.device)
-            else:
-                background = self.background_color.to(self.device)
-
+        # cropping
         if self.crop_box is not None and not self.training:
             crop_ids = self.crop_box.within(self.means).squeeze()
             if crop_ids.sum() == 0:
-                rgb = background.repeat(
-                    int(camera.height.item()), int(camera.width.item()), 1
+                return self.get_empty_outputs(
+                    int(camera.width.item()), int(camera.height.item()), self.background_color
                 )
-                depth = background.new_ones(*rgb.shape[:2], 1) * 10
-                accumulation = background.new_zeros(*rgb.shape[:2], 1)
-                return {
-                    "rgb": rgb,
-                    "depth": depth,
-                    "accumulation": accumulation,
-                    "background": background,
-                }
         else:
             crop_ids = None
-        camera_downscale = self._get_downscale_factor()
-        camera.rescale_output_resolution(1 / camera_downscale)
-        # shift the camera to center of scene looking at center
-        R = optimized_camera_to_world[:3, :3]  # 3 x 3
-        T = optimized_camera_to_world[:3, 3:4]  # 3 x 1
-
-        # flip the z and y axes to align with gsplat conventions
-        R_edit = torch.diag(
-            torch.tensor([1, -1, -1], device=self.device, dtype=R.dtype)
-        )
-        R = R @ R_edit
-        # analytic matrix inverse to get world2camera matrix
-        R_inv = R.T
-        T_inv = -R_inv @ T
-        viewmat = torch.eye(4, device=R.device, dtype=R.dtype)
-        viewmat[:3, :3] = R_inv
-        viewmat[:3, 3:4] = T_inv
-        # calculate the FOV of the camera given fx and fy, width and height
-        cx = camera.cx.item()
-        cy = camera.cy.item()
-        W, H = int(camera.width.item()), int(camera.height.item())
-        self.last_size = (H, W)
 
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
@@ -1151,146 +1457,164 @@ class SageSplatModel(SplatfactoModel):
             quats_crop = self.quats
             clip_embeds_crop = self.clip_embeds
             affordance_crop = self.affordance
+        colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
-        colors_crop = torch.cat(
-            (features_dc_crop[:, None, :], features_rest_crop), dim=1
-        )
-        BLOCK_WIDTH = (
-            16  # this controls the tile size of rasterization, 16 is a good default
-        )
-        self.xys, depths, self.radii, conics, comp, num_tiles_hit, cov3d = project_gaussians(  # type: ignore
-            means_crop,
-            torch.exp(scales_crop),
-            1,
-            quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            viewmat.squeeze()[:3, :],
-            camera.fx.item(),
-            camera.fy.item(),
-            cx,
-            cy,
-            H,
-            W,
-            BLOCK_WIDTH,
-        )  # type: ignore
-
-        # rescale the camera back to original dimensions before returning
-        camera.rescale_output_resolution(camera_downscale)
-
-        if (self.radii).sum() == 0:
-            rgb = background.repeat(H, W, 1)
-            depth = background.new_ones(*rgb.shape[:2], 1) * 10
-            accumulation = background.new_zeros(*rgb.shape[:2], 1)
-
-            return {
-                "rgb": rgb,
-                "depth": depth,
-                "accumulation": accumulation,
-                "background": background,
-            }
-
-        # Important to allow xys grads to populate properly
-        if self.training:
-            # TODO
-            if self.means.requires_grad:
-                self.xys.retain_grad()
-
-        if self.config.sh_degree > 0:
-            viewdirs = (
-                means_crop.detach() - optimized_camera_to_world.detach()[:3, 3]
-            )  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            n = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
-            rgbs = spherical_harmonics(n, viewdirs, colors_crop)
-            rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
-        else:
-            rgbs = torch.sigmoid(colors_crop[:, 0, :])
-
-        assert (num_tiles_hit > 0).any()  # type: ignore
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        K = camera.get_intrinsics_matrices().cuda()
+        W, H = int(camera.width.item()), int(camera.height.item())
+        self.last_size = (H, W)
+        # camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         # apply the compensation of screen space blurring to gaussians
-        opacities = None
-        if self.config.rasterize_mode == "antialiased":
-            opacities = torch.sigmoid(opacities_crop) * comp[:, None]
-        elif self.config.rasterize_mode == "classic":
-            opacities = torch.sigmoid(opacities_crop)
-        else:
+        if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        rgb, alpha = rasterize_gaussians(  # type: ignore
-            self.xys,
-            depths,
-            self.radii,
-            conics,
-            num_tiles_hit,  # type: ignore
-            rgbs,
-            opacities,
-            H,
-            W,
-            BLOCK_WIDTH,
-            background=background,
-            return_alpha=True,
-        )  # type: ignore
-        alpha = alpha[..., None]
-        rgb = torch.clamp(rgb, max=1.0)  # type: ignore
-        depth_im = None
         if self.config.output_depth_during_training or not self.training:
-            depth_im = rasterize_gaussians(  # type: ignore
-                self.xys,
-                depths,
-                self.radii,
-                conics,
-                num_tiles_hit,  # type: ignore
-                depths[:, None].repeat(1, 3),
-                opacities,
-                H,
-                W,
-                BLOCK_WIDTH,
-                background=torch.zeros(3, device=self.device),
-            )[
-                ..., 0:1
-            ]  # type: ignore
-            depth_im = torch.where(alpha > 0, depth_im / alpha, depth_im.detach().max())
+            render_mode = "RGB+ED"
+        else:
+            render_mode = "RGB"
+
+        if self.config.sh_degree > 0:
+            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+        else:
+            colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
+            sh_degree_to_use = None
+
+        render, alpha, self.info = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+            means=means_crop,
+            quats=quats_crop,  # rasterization does normalization internally
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=colors_crop,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            packed=False,
+            near_plane=0.001,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=sh_degree_to_use,
+            sparse_grad=False,
+            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
+            rasterize_mode=self.config.rasterize_mode,
+            # set some threshold to disregrad small gaussians for faster rendering.
+            # radius_clip=3.0,
+        )
+        self.xys = self.info["means2d"]
+        self.radii = self.info["radii"]
+        camera.rescale_output_resolution(camera_scale_fac)
+        background = self._get_background_color()
+        alpha = alpha[:, ...]
+        rgb = render[:, ..., :3] + (1 - alpha) * background
+        rgb = torch.clamp(rgb, 0.0, 1.0) # type: ignore
+        depth_im = None
+        if render_mode == "RGB+ED":
+            depth_im = render[:, ..., 3:4]
+            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
+        else:
+            depth_im = None
+        # if self.config.output_depth_during_training or not self.training:
+        #     depth_im = rasterize_gaussians(  # type: ignore
+        #         self.xys,
+        #         depths,
+        #         self.radii,
+        #         conics,
+        #         num_tiles_hit,  # type: ignore
+        #         depths[:, None].repeat(1, 3),
+        #         opacities,
+        #         H,
+        #         W,
+        #         BLOCK_WIDTH,
+        #         background=torch.zeros(3, device=self.device),
+        #     )[
+        #         ..., 0:1
+        #     ]  # type: ignore
+        #     depth_im = torch.where(alpha > 0, depth_im / alpha, depth_im.detach().max())
 
         # CLIP Embeddings
-        clip_embeds_im = rasterize_gaussians(  # type: ignore
-            self.xys,
-            depths,
-            self.radii,
-            conics,
-            num_tiles_hit,
-            clip_embeds_crop,
-            opacities,
-            H,
-            W,
-            BLOCK_WIDTH,
-            self.clip_background,
+        # clip_embeds_im = rasterize_gaussians(  # type: ignore
+        #     self.xys,
+        #     depths,
+        #     self.radii,
+        #     conics,
+        #     num_tiles_hit,
+        #     clip_embeds_crop,
+        #     opacities,
+        #     H,
+        #     W,
+        #     BLOCK_WIDTH,
+        #     self.clip_background,
+        # )
+        clip_embeds_im, clip_alpha, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+            means=means_crop,
+            quats=quats_crop,  # rasterization does normalization internally
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=clip_embeds_crop,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            packed=False,
+            near_plane=0.001,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=None,
+            sparse_grad=False,
+            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
+            rasterize_mode=self.config.rasterize_mode,
+            # set some threshold to disregrad small gaussians for faster rendering.
+            # radius_clip=3.0,
         )
-
-        # Affordance
-        affordance_im = rasterize_gaussians(  # type: ignore
-            self.xys,
-            depths,
-            self.radii,
-            conics,
-            num_tiles_hit,
-            torch.sigmoid(affordance_crop).repeat(1, 3),
-            opacities,
-            H,
-            W,
-            BLOCK_WIDTH,
-            self.affordance_background,
-        )[..., 0:1]
-
+        clip_embeds_im = clip_embeds_im[:, ..., :3] + (1 - clip_alpha) * self.clip_background
+        affordance_im, _, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+            means=means_crop,
+            quats=quats_crop,  # rasterization does normalization internally
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=affordance_crop,
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            packed=False,
+            near_plane=0.001,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=None,
+            sparse_grad=False,
+            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
+            rasterize_mode=self.config.rasterize_mode,
+            # set some threshold to disregrad small gaussians for faster rendering.
+            # radius_clip=3.0,
+        )
+        # # Affordance
+        # affordance_im = rasterize_gaussians(  # type: ignore
+        #     self.xys,
+        #     depths,
+        #     self.radii,
+        #     conics,
+        #     num_tiles_hit,
+        #     torch.sigmoid(affordance_crop).repeat(1, 3),
+        #     opacities,
+        #     H,
+        #     W,
+        #     BLOCK_WIDTH,
+        #     self.affordance_background,
+        # )[..., 0:1]
         # clamp the outputs
         affordance_im = torch.clamp(affordance_im, max=1.0)
-
+        affordance_im = affordance_im.squeeze(0)
         # outputs
         outputs = {
-            "rgb": rgb,
+            "rgb": rgb.squeeze(0),
             "depth": depth_im,
-            "clip": clip_embeds_im,
-            "affordance": affordance_im,
-            "accumulation": alpha,
+            "clip": clip_embeds_im.squeeze(0),
+            "affordance": affordance_im[..., 0:1],
+            "accumulation": alpha.squeeze(0),
             "background": background,
         }  # type: ignore
 
@@ -1377,9 +1701,12 @@ class SageSplatModel(SplatfactoModel):
             # Affordance
             gt_affordance_img = TF.resize(
                 batch["affordance"].permute(2, 0, 1),
-                outputs["affordance"].shape[:-1],
+                outputs["affordance"].shape[-3:-1],
                 antialias=None,
             ).permute(1, 2, 0)
+        else:
+            # No resizing needed, use original affordanc
+            gt_affordance_img = batch["affordance"]
 
         # Dimensionality reduction on the CLIP embeddings
         clip_enc_inputs = batch["clip"].view(-1, self.clip_embeds_input_dim)
@@ -1409,7 +1736,7 @@ class SageSplatModel(SplatfactoModel):
                 # CLIP Embeddings
                 clip_latent_img = TF.resize(
                     clip_latent.permute(2, 0, 1),
-                    outputs["clip"].shape[:-1],
+                    outputs["clip"].shape[-3:-1],
                     interpolation=TF.InterpolationMode.BILINEAR,
                     antialias=None,
                 ).permute(1, 2, 0)
@@ -1516,6 +1843,46 @@ class SageSplatModel(SplatfactoModel):
             tuple(self.clip_encoder.parameters())[0].requires_grad_(False)
             tuple(self.clip_decoder.parameters())[0].requires_grad_(False)
 
+        # Depth losses (optional)
+        if self.config.use_depth_loss and outputs.get("depth", None) is not None:
+            pred_depth = outputs["depth"]
+            gt_depth = None
+            if "sensor_depth" in batch:
+                gt_depth = self.get_gt_img(batch["sensor_depth"]).to(self.device)
+            elif "mono_depth" in batch:
+                gt_depth = self.get_gt_img(batch["mono_depth"]).to(self.device)
+
+            if gt_depth is not None:
+                # Resize to prediction size if needed
+                if gt_depth.shape[:2] != pred_depth.shape[:2]:
+                    import torchvision.transforms.functional as TF
+                    gt_depth = TF.resize(
+                        gt_depth.permute(2, 0, 1), pred_depth.shape[:2], antialias=None
+                    ).permute(1, 2, 0)
+
+                # Apply mask if present
+                if "mask" in batch:
+                    mask = self._downscale_if_required(batch["mask"]).to(self.device)
+                    if mask.shape[:2] != pred_depth.shape[:2]:
+                        import torchvision.transforms.functional as TF
+                        mask = TF.resize(
+                            mask.permute(2, 0, 1), pred_depth.shape[:2], antialias=None
+                        ).permute(1, 2, 0)
+                    pred_depth = pred_depth * mask
+                    gt_depth = gt_depth * mask
+
+                if self.depth_loss is not None:
+                    # Edge-aware variants accept rgb and mask
+                    if self.config.depth_loss_type in ["EdgeAwareLogL1"]:
+                        depth_term = self.depth_loss(pred_depth, gt_depth, gt_img, None)
+                    else:
+                        depth_term = self.depth_loss(pred_depth, gt_depth)
+                    main_loss = main_loss + self.config.depth_lambda * depth_term
+
+                if self.smooth_loss is not None and self.config.use_depth_smooth_loss:
+                    smooth_term = self.smooth_loss(pred_depth, gt_img)
+                    main_loss = main_loss + self.config.smooth_loss_lambda * smooth_term
+
         loss_dict = {
             "main_loss": main_loss,
             "scale_reg": scale_reg,
@@ -1524,7 +1891,6 @@ class SageSplatModel(SplatfactoModel):
         if self.training:
             # Add loss from camera optimizer
             self.camera_optimizer.get_loss_dict(loss_dict)
-
         return loss_dict
 
     @torch.no_grad()
