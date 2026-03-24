@@ -1,0 +1,44 @@
+.
+├── __init__.py  — `sagesplat` 包的初始化文件，当前是空文件，主要作用是把整个目录声明成 Python 包，方便 `import sagesplat...`。
+├── clip  — 改造版 CLIP 子模块，核心用途是提供“稠密 patch 特征”而不是只输出整图特征；这是 SageSplat 语义监督的重要基础。
+│   ├── bpe_simple_vocab_16e6.txt.gz  — CLIP 分词器用的 BPE 词表文件，`simple_tokenizer.py` 会读取它，把自然语言文本切成 token。
+│   ├── clip.py  — CLIP 的加载与对外接口封装文件，负责下载模型、加载权重、构造预处理流程、暴露 `load()`、`tokenize()` 这类入口。
+│   ├── interpolate.py  — 位置编码插值工具，解决输入分辨率变化时视觉位置编码不匹配的问题，让 CLIP/ViT 能更稳地处理不同大小图像。
+│   ├── model.py  — 改造版 CLIP 主体实现，包含 ResNet、ViT、文本编码器、视觉编码器等；这里最关键的改动是支持 `get_patch_encodings()`，也就是输出 patch 级稠密特征。
+│   ├── README.md  — 这个子目录的简短说明，点明这里不是原封不动的 OpenAI CLIP，而是带“dense patch-level feature extraction”和位置编码插值的版本。
+│   └── simple_tokenizer.py  — CLIP 的 BPE 分词器实现，把输入文本变成 token id；供查询词、正负文本提示词编码使用。
+├── data  — 数据管理层，负责把训练图像、语义特征、affordance 监督组织成 SageSplat 训练时真正吃到的 batch。
+│   ├── __init__.py  — 空的包初始化文件。
+│   ├── sagesplat_datamanager.py  — SageSplat 的数据管理核心文件，继承 Nerfstudio 的全图 datamanager；负责读取训练图像、预缓存 CLIP 特征与 affordance 图，并在 `next_train()` 中把 `image`、`clip`、`affordance` 一起返回给模型。
+│   └── utils  — 数据侧辅助模块，主要解决“特征提取、缓存、复用”的问题。
+│       ├── __init__.py  — 空的包初始化文件。
+│       ├── affordance_dataloader.py  — affordance 监督生成器。它会用 `LangSAM` 找物体框，再调用 `vrb` 里的网络预测 contact point 与 trajectory，最终生成接触热图和方向信息，并缓存为训练监督。
+│       ├── feature_dataloader.py  — 特征 dataloader 抽象基类，定义了 `create()`、`load()`、`save()`、`try_load()` 这一套缓存逻辑；`maskclip_dataloader.py` 和 `affordance_dataloader.py` 都继承它。
+│       ├── maskclip_dataloader.py  — CLIP 特征 dataloader，负责调用图像编码器抽取 patch 特征、按训练分辨率做 resize、做归一化、保存到缓存，下次训练可以直接读。
+│       └── utils.py  — 小工具文件，主要提供 PCA 可视化函数，把高维特征投成 3 通道颜色，常用于观察语义特征场长什么样。
+├── encoders  — 图像编码器层，负责定义“怎样从图像得到外部语义特征”。
+│   ├── __init__.py  — 空的包初始化文件。
+│   ├── image_encoder.py  — 图像编码器抽象接口，定义名字、维度、`encode_image()`、`get_relevancy()` 等规范，方便后续替换不同视觉编码器。
+│   └── maskclip_encoder.py  — 具体的图像编码器实现，基于上面的改造版 CLIP；负责跳过中心裁剪、提取 patch 特征、重排成空间特征图，并记录输入输出分辨率比例。
+├── sagesplat_config.py  — SageSplat 的 Nerfstudio 方法配置入口。这里把 datamanager、模型、图像编码器、训练步数、各参数组优化器和学习率全都组装起来，并注册成可训练的方法。
+├── sagesplat_pipeline.py  — SageSplat 的训练/推理管线装配文件。它把图像编码器、datamanager、模型接在一起，并在有 COLMAP 点时把 3D 点作为高斯初始化种子传给模型。
+├── sagesplat.py  — 整个项目最核心的文件，真正的 SageSplat 模型实现。它在 Splatfacto 的基础上新增了每个高斯的 `clip_embeds` 和 `affordance`，实现了语义/affordance 渲染、文本查询、损失函数、densify/cull 时附加属性的维护。
+├── viewer_utils.py  — 交互查询辅助模块，主要服务 viewer 或推理时的文本输入。它负责把正样本词、负样本词编码成文本嵌入，并维护查询状态，供 `sagesplat.py` 里的语义匹配逻辑使用。
+└── vrb  — 外部集成的 VRB 模块，不是 SageSplat 自己提出的主模型，而是被拿来生成 affordance 监督的上游组件。
+    ├── demo.py  — VRB 的独立 demo 入口，读一张图、加载模型、跑推理、输出可视化结果。
+    ├── download_model.sh  — 下载 VRB 预训练权重的脚本，本质上就是用 `gdown` 拉取 checkpoint。
+    ├── environment.yml  — VRB 的 Conda 环境定义文件，描述它原始运行环境依赖。
+    ├── inference.py  — VRB 的推理脚本，输入单张图像后，会用 `LangSAM` 找候选对象，再让 VRB 预测 contact points 和 post-contact trajectory，最后把结果画成热图和箭头。
+    ├── kitchen_out.png  — VRB demo 的示例输出图之一，用来展示模型在厨房图像上的预测效果。
+    ├── kitchen.jpeg  — VRB demo 的示例输入图。
+    ├── LICENSE  — VRB 子模块自带的许可证文件，这里是 MIT License。
+    ├── models  — VRB 预训练模型目录。
+    │   └── model_checkpoint_1249.pth.tar  — VRB 的预训练权重文件，`affordance_dataloader.py` 会加载它来生成接触热图监督。
+    ├── networks  — VRB 模型内部网络结构定义。
+    │   ├── layer.py  — Transformer/注意力层级组件，包含 MLP、Multi-Head Attention、EncoderBlock、DecoderBlock 等基础网络块。
+    │   ├── model.py  — VRB 主网络实现，负责把图像编码成特征，并同时预测 contact point 分布和后续动作轨迹，是 VRB 的核心模型文件。
+    │   ├── net_utils.py  — VRB 的网络工具函数，包含 mask 构造、初始化、drop path、轨迹与 affordance 距离计算等小组件。
+    │   └── traj.py  — 轨迹建模模块，主要是 CVAE 形式的轨迹预测头，用来根据上下文生成未来手部/接触后的运动轨迹。
+    ├── out_kitchen.png  — VRB README 里展示的输出示例图，属于文档配套资源。
+    ├── README.md  — VRB 上游项目说明文档，解释它的任务定义、安装方式、运行方式和论文背景。
+    └── requirements.txt  — VRB 的 pip 依赖列表，补充 `environment.yml` 里没有覆盖的 Python 包版本。
