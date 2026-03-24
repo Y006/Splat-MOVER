@@ -112,6 +112,15 @@ export TCNN_CUDA_ARCHITECTURES=86
 
 上面两项不是强制，但能减少 `tiny-cuda-nn` / CUDA 扩展的编译歧义。
 
+对于 4090：
+```bash
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="8.9"
+export TCNN_CUDA_ARCHITECTURES=89
+```
+
 ## 5. 用 uv 安装依赖
 
 ### 5.1 安装 PyTorch
@@ -174,6 +183,8 @@ uv pip install --no-build-isolation \
 
 ```bash
 uv pip install "git+https://github.com/luca-medeiros/lang-segment-anything.git@a1a9557"
+uv pip install "git+ssh://git@github.com:luca-medeiros/lang-segment-anything.git@a1a9557"
+
 ```
 
 不要安装最新主干版本替代这个提交。

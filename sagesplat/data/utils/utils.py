@@ -1,7 +1,15 @@
 from typing import Optional
 
 import torch
-from torchtyping import TensorType
+# from torchtyping import TensorType
+from typing import Optional, Any
+
+try:
+    from torchtyping import TensorType
+except Exception:
+    class TensorType:
+        def __class_getitem__(cls, item):
+            return Any
 
 
 def apply_pca_colormap_return_proj(
