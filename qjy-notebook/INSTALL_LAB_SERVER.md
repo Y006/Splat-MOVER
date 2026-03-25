@@ -311,3 +311,11 @@ outputs/<scene_name>/sagesplat/<timestamp>/config.yml
 ## 10. 一句话总结
 
 最稳妥的做法是：`Python 3.10 + CUDA 11.8 + torch 2.1.2 + nerfstudio 1.1.0 + gsplat 0.1.13 + lang-sam@a1a9557`，然后只编译 `graspnet_baseline` 里的 `pointnet2/knn`，不要把 `graspnet` 自带的旧 requirements 当作主环境标准。
+
+
+
+### 执行命令
+
+```bash
+ns-train sagesplat --output-dir /share3/home/qiujinyu/Splat-MOVER/qjy-add/exp1 --data /share3/home/qiujinyu/Splat-MOVER/qjy-download-data/asknerf_drill_mat_block --experiment-name drill_smoke_test --max-num-iterations 1000 --steps-per-save 500 --steps-per-eval-image 100 --mixed-precision True --pipeline.datamanager.camera-res-scale-factor 0.5 --pipeline.datamanager.cache-images cpu --pipeline.datamanager.images-on-gpu False --pipeline.model.eval-num-rays-per-chunk 2048 --viewer.num-rays-per-chunk 16384 --vis viewer colmap
+```

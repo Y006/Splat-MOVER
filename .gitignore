@@ -8,3 +8,6 @@
 
 # Platform-dependent files
 *.DS_Store
+
+/qjy-download-data
+/qjy-add/exp1/*

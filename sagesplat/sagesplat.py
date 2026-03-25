@@ -276,6 +276,8 @@ class SageSplatModelConfig(SplatfactoModelConfig):
     """threshold of ratio of gaussian max to min scale before applying regularization
     loss from the PhysGaussian paper
     """
+    use_absgrad: bool = False
+    """Whether to use absolute image-plane gradient for densification strategy."""
     output_depth_during_training: bool = True
     """If True, output depth during training. Otherwise, only output depth during evaluation."""
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
@@ -333,6 +335,9 @@ class SageSplatModel(SplatfactoModel):
     ):
         self.seed_points = seed_points
         super().__init__(*args, **kwargs)
+
+    def _get_background_color(self):
+        return self.background_color.to(self.device)
 
     def populate_modules(self):
         # image encoder
@@ -1504,9 +1509,13 @@ class SageSplatModel(SplatfactoModel):
             # radius_clip=3.0,
         )
         self.xys = self.info["means2d"]
+        if self.training and self.xys.requires_grad:
+            self.xys.retain_grad()
         self.radii = self.info["radii"]
         camera.rescale_output_resolution(camera_scale_fac)
-        background = self._get_background_color()
+        # background = self._get_background_color()
+        # background = self.background_color
+        background = self._get_background_color().to(render.device)
         alpha = alpha[:, ...]
         rgb = render[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0) # type: ignore
